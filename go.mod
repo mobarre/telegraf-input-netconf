@@ -3,7 +3,7 @@ module github.com/mobarre/telegraf-input-netconf
 go 1.25.1
 
 require (
-	github.com/cisco-ie/netgonf v0.0.0-20200421160712-10a7ca737235
+	github.com/Juniper/go-netconf v0.3.1
 	github.com/influxdata/telegraf v1.36.2
 	golang.org/x/crypto v0.42.0
 )
