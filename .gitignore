@@ -1,0 +1,33 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Build output
+bin/
+dist/
+
+# Dependency directories
+vendor/
+
+# LiteIDE specific files
+.liteide/
+*.liteide
+*.liteide~
+*.bak
+*.swp
+
+# Go workspace file
+go.work
+
+# Environment files
+.env
+.env.local
+
+# Logs
+*.log
