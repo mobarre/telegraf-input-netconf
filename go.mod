@@ -3,6 +3,7 @@ module github.com/mobarre/telegraf-input-netconf
 go 1.25.1
 
 require (
+	github.com/BurntSushi/toml v1.5.0
 	github.com/Juniper/go-netconf v0.3.1
 	github.com/influxdata/telegraf v1.36.2
 	github.com/influxdata/toml v0.0.0-20190415235208-270119a8ce65
@@ -12,7 +13,6 @@ require (
 require (
 	cel.dev/expr v0.25.1 // indirect
 	filippo.io/edwards25519 v1.1.0 // indirect
-	github.com/BurntSushi/toml v1.5.0 // indirect
 	github.com/alecthomas/participle v0.4.1 // indirect
 	github.com/alecthomas/units v0.0.0-20240927000941-0f3dac36c52b // indirect
 	github.com/antchfx/jsonquery v1.3.6 // indirect
