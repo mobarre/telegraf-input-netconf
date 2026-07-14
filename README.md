@@ -2,26 +2,33 @@
 
 An [`execd`](https://github.com/influxdata/telegraf/tree/master/plugins/inputs/execd)
 input plugin for [Telegraf](https://github.com/influxdata/telegraf) that collects
-interface counters from NETCONF-enabled network devices (Cisco, Juniper, …) over
-SSH.
+metrics from NETCONF-over-SSH devices (Cisco, Juniper, …).
 
-SSH sessions are opened once and kept alive across polls to avoid paying the
-session-setup cost on every gather cycle. A session that fails an RPC is dropped
-and transparently re-established on the next cycle.
+It is **model-agnostic**: what to poll and how to turn the reply into metrics is
+entirely user-configured through *sensors* — a NETCONF RPC plus a Telegraf
+[XPath](https://github.com/influxdata/telegraf/tree/master/plugins/parsers/xpath)
+mapping. Interfaces, BGP, system state, or any YANG data are just different
+sensors; the plugin core is not tied to any data model.
 
-> **Status: beta.** This has only been exercised in a lab and not yet validated
-> against production Cisco or Juniper hardware. The interface-statistics data
-> model in particular (see [Caveats](#caveats)) is likely to need per-platform
-> adjustment. Use it in a lab first.
+It runs as a **single daemon holding one warm SSH/NETCONF session per device**.
+The session handshake is paid once per device, not once per poll; sessions are
+reused across cycles, recycled after a long timer (`session_max_age`) or on
+failure, and devices are polled concurrently. The reasoning behind this design —
+and the alternatives that were rejected — is documented in [DESIGN.md](DESIGN.md).
 
-## What it collects
+> **Status: beta.** Exercised in a lab, not yet validated against production
+> Cisco/Juniper hardware. The example interface sensor's data model in
+> particular (see [Caveats](#caveats)) may need per-platform adjustment.
 
-For each configured device it issues a NETCONF `<get>` for `ietf-interfaces`
-interface statistics and emits one measurement per interface:
+## Metrics
+
+There are no built-in measurements — each sensor defines its own via its XPath
+mapping. Every metric is additionally tagged with `device` (the configured
+address). The example sensor below produces:
 
 - **Measurement:** `netconf_interface`
-- **Tags:** `device` (the configured address), `interface` (interface name)
-- **Fields:** `input_bytes`, `output_bytes` (from `in-octets` / `out-octets`)
+- **Tags:** `device`, `interface`
+- **Fields:** `input_bytes`, `output_bytes`
 
 ## Build
 
@@ -31,27 +38,43 @@ Requires Go (see `go.mod` for the minimum version).
 go build -o bin/netconf-client ./cmd/netconf-client
 ```
 
-## Configuration
+## Running
 
-The binary is a Telegraf `execd` shim. Point it at a plugin config file:
+The binary is a Telegraf `execd` shim. Reference it from your main Telegraf
+config, letting our daemon drive its own poll cadence:
 
-```sh
-bin/netconf-client --config cmd/netconf-client/plugin.conf
+```toml
+[[inputs.execd]]
+  command = ["/path/to/netconf-client", "--config", "/etc/telegraf/netconf/plugin.conf", "--poll_interval", "5m"]
+  ## The daemon self-times on --poll_interval; the parent only consumes stdout.
+  signal = "none"
 ```
 
-Example `plugin.conf`:
+## Configuration
+
+Example `plugin.conf` (one instance owns the whole fleet):
 
 ```toml
 [[inputs.netconf]]
   ## Timeout for connecting to and polling each device.
   # timeout = "10s"
 
+  ## How long a session is reused before it is proactively recycled.
+  # session_max_age = "1h"
+
+  ## Maximum number of devices dialed/polled concurrently (0 = unlimited).
+  ## Matters most at start-up and recycle, where it bounds the dial burst.
+  # max_concurrent_devices = 10
+
   ## Path to an OpenSSH known_hosts file used to verify device host keys.
-  ## Defaults to ~/.ssh/known_hosts.
-  # known_hosts_file = "/etc/telegraf/known_hosts"
+  ## Required unless insecure_skip_verify is set (see below).
+  known_hosts_file = "/etc/telegraf/known_hosts"
 
   ## Disable host key verification entirely. INSECURE - lab use only.
   # insecure_skip_verify = false
+
+  ## Devices may be listed inline and/or loaded from a directory (see below).
+  # devices_directory = "/etc/telegraf/netconf.d"
 
   [[inputs.netconf.devices]]
     address = "192.168.1.1:830"
@@ -59,29 +82,60 @@ Example `plugin.conf`:
     ## Password supports Telegraf secret-store references, e.g. "@{store:key}".
     password = "password"
 
-  [[inputs.netconf.devices]]
-    address = "192.168.1.2:830"
-    username = "admin"
-    password = "password"
+  ## One or more sensors. Tip: match elements with local-name() to ignore
+  ## NETCONF's XML namespaces without declaring them.
+  [[inputs.netconf.sensor]]
+    rpc = '''
+      <get>
+        <filter type="subtree">
+          <interfaces xmlns="urn:ietf:params:xml:ns:yang:ietf-interfaces"/>
+        </filter>
+      </get>
+    '''
+    metric_name = "'netconf_interface'"
+    metric_selection = "//*[local-name()='interface']"
+    [inputs.netconf.sensor.tags]
+      interface = "*[local-name()='name']"
+    [inputs.netconf.sensor.fields_int]
+      input_bytes  = ".//*[local-name()='in-octets']"
+      output_bytes = ".//*[local-name()='out-octets']"
 ```
 
-Then reference the shim from your main Telegraf config with the
-[`execd`](https://github.com/influxdata/telegraf/tree/master/plugins/inputs/execd)
-input:
+### Sensors
+
+A sensor's `rpc` is sent verbatim (wrapped in `<rpc>…</rpc>`), and the reply is
+handed to a Telegraf XPath parser. All
+[xpath parser options](https://github.com/influxdata/telegraf/tree/master/plugins/parsers/xpath)
+— `metric_name`, `metric_selection`, `tags`, `fields`, `fields_int`,
+`timestamp`, etc. — are available as keys of the `[[inputs.netconf.sensor]]`
+table. Add one sensor per thing you want to poll.
+
+### Devices directory
+
+For large fleets, keep one file per device (easy to template and manage) and
+point `devices_directory` at them. Each `*.toml` file holds one or more
+`[[devices]]` entries, merged into the single instance at start-up:
 
 ```toml
-[[inputs.execd]]
-  command = ["/path/to/netconf-client", "--config", "/path/to/plugin.conf"]
-  signal = "none"
+# /etc/telegraf/netconf.d/r1.toml
+[[devices]]
+  address = "r1:830"
+  username = "admin"
+  password = "@{store:r1}"
 ```
+
+Inline `[[inputs.netconf.devices]]` and `devices_directory` are both honored and
+merged. Add or remove a device by dropping/deleting a file and reloading
+Telegraf.
 
 ### Host key verification
 
-By default the plugin verifies each device's SSH host key against an OpenSSH
-`known_hosts` file (`~/.ssh/known_hosts` unless `known_hosts_file` is set). If
-the file cannot be loaded, `Init` fails with a clear error. Set
-`insecure_skip_verify = true` to bypass verification — this disables a real
-security control and is intended for lab use only.
+The plugin verifies each device's SSH host key against an OpenSSH `known_hosts`
+file. `known_hosts_file` is **required** — there is no default, because the
+telegraf user often has no home directory. If the file cannot be loaded, `Init`
+fails with a clear error. Set `insecure_skip_verify = true` to bypass
+verification entirely — this disables a real security control and is intended
+for lab use only.
 
 ### Passwords
 
@@ -91,12 +145,12 @@ instead of being written in plaintext.
 
 ## Caveats
 
-- **Data model.** `ietf-interfaces` exposes operational counters under
+- **Example data model.** `ietf-interfaces` exposes operational counters under
   `/interfaces-state/interface/statistics` on RFC 7223 devices and under
-  `/interfaces/interface/statistics` on RFC 8343 (NMDA) devices. The current
-  request/parse path targets the latter and may need adjusting for your
-  platform.
-- Only interface `in-octets` / `out-octets` are collected today.
+  `/interfaces/interface/statistics` on RFC 8343 (NMDA) devices. The example
+  sensor targets the latter and may need adjusting for your platform.
+- Secret-store references (`@{store:…}`) depend on the secret-store machinery
+  being available in the runtime.
 
 ## License
 
