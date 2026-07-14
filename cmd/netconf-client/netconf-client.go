@@ -18,7 +18,6 @@ var pollIntervalDisabled = flag.Bool(
 	"set to true to disable polling. You want to use this when you are sending metrics on your own schedule",
 )
 var configFile = flag.String("config", "", "path to the config file for this plugin")
-var err error
 
 func main() {
 	// parse command line options
@@ -30,13 +29,13 @@ func main() {
 	// create the shim. This is what will run your plugins.
 	shimLayer := shim.New()
 
-	if err = shimLayer.LoadConfig(configFile); err != nil {
+	if err := shimLayer.LoadConfig(configFile); err != nil {
 		fmt.Fprintf(os.Stderr, "Err loading input: %s\n", err)
 		os.Exit(1)
 	}
 
 	// run a single plugin until stdin closes, or we receive a termination signal
-	if err = shimLayer.Run(*pollInterval); err != nil {
+	if err := shimLayer.Run(*pollInterval); err != nil {
 		fmt.Fprintf(os.Stderr, "Err: %s\n", err)
 		os.Exit(1)
 	}

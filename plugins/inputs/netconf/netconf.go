@@ -14,15 +14,18 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 // Package netconf implements a Telegraf input plugin for collecting metrics
-// from NETCONF-enabled devices (Cisco, Juniper, etc.).
+// from NETCONF-enabled devices (Cisco, Juniper, etc.). It is protocol-model
+// agnostic: what to poll and how to turn replies into metrics is entirely
+// driven by user-configured sensors.
 
 package netconf
 
 import (
-	"encoding/xml"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +33,7 @@ import (
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/inputs"
+	"github.com/influxdata/telegraf/plugins/parsers/xpath"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
@@ -38,21 +42,6 @@ import (
 // timeout is configured.
 const defaultTimeout = 10 * time.Second
 
-// getInterfaceStatistics is the NETCONF <get> request used to poll interface
-// counters. Note: ietf-interfaces places operational counters under
-// /interfaces-state on RFC 7223 devices and under /interfaces on RFC 8343
-// (NMDA) devices; the response parsing below expects the latter. This has only
-// been validated in a lab and may need adjusting per platform.
-const getInterfaceStatistics = `<get>
-  <filter type="subtree">
-    <interfaces xmlns="urn:ietf:params:xml:ns:yang:ietf-interfaces">
-      <interface>
-        <statistics/>
-      </interface>
-    </interfaces>
-  </filter>
-</get>`
-
 // Device represents a single NETCONF device.
 type Device struct {
 	Address  string        `toml:"address"`
@@ -60,9 +49,25 @@ type Device struct {
 	Password config.Secret `toml:"password"`
 }
 
+// Sensor pairs a NETCONF RPC with an XPath mapping that turns the reply into
+// metrics. The embedded xpath.Config exposes the standard Telegraf xpath
+// options (metric_name, metric_selection, tags, fields, fields_int, …)
+// directly as keys of the [[inputs.netconf.sensor]] table, so the plugin is
+// not tied to any particular data model.
+type Sensor struct {
+	// RPC is the NETCONF operation payload sent to each device. go-netconf
+	// wraps it in <rpc>…</rpc>, so provide the inner operation (e.g. a <get>).
+	RPC string `toml:"rpc"`
+
+	xpath.Config
+
+	parser *xpath.Parser
+}
+
 // Netconf is the main plugin struct.
 type Netconf struct {
 	Devices []Device `toml:"devices"`
+	Sensors []Sensor `toml:"sensor"`
 
 	// Timeout bounds both connecting to and polling each device.
 	Timeout config.Duration `toml:"timeout"`
@@ -95,16 +100,39 @@ func (n *Netconf) SampleConfig() string {
   ## Disable host key verification entirely. INSECURE - lab use only.
   # insecure_skip_verify = false
 
-  ## One or more NETCONF devices to poll.
+  ## One or more NETCONF devices to poll. Every sensor below is polled on
+  ## every device.
   [[inputs.netconf.devices]]
     address = "192.168.1.1:830"
     username = "admin"
     ## Password supports Telegraf secret-store references, e.g. "@{store:key}".
     password = "password"
+
+  ## A sensor is a NETCONF RPC plus an XPath mapping describing how to turn the
+  ## reply into metrics. Add as many as you need (interfaces, BGP, system, …).
+  ## The xpath options are documented at:
+  ## https://github.com/influxdata/telegraf/tree/master/plugins/parsers/xpath
+  ## Tip: match elements with local-name() to ignore NETCONF's XML namespaces.
+  [[inputs.netconf.sensor]]
+    rpc = '''
+      <get>
+        <filter type="subtree">
+          <interfaces xmlns="urn:ietf:params:xml:ns:yang:ietf-interfaces"/>
+        </filter>
+      </get>
+    '''
+    metric_name = "'netconf_interface'"
+    metric_selection = "//*[local-name()='interface']"
+    [inputs.netconf.sensor.tags]
+      interface = "*[local-name()='name']"
+    [inputs.netconf.sensor.fields_int]
+      input_bytes  = ".//*[local-name()='in-octets']"
+      output_bytes = ".//*[local-name()='out-octets']"
 `
 }
 
-// Init validates the configuration and builds the SSH host key callback once.
+// Init validates the configuration, builds a parser per sensor, and builds the
+// SSH host key callback once.
 func (n *Netconf) Init() error {
 	if n.connections == nil {
 		n.connections = make(map[string]*netconf.Session)
@@ -112,7 +140,35 @@ func (n *Netconf) Init() error {
 	if n.Timeout <= 0 {
 		n.Timeout = config.Duration(defaultTimeout)
 	}
+	if len(n.Sensors) == 0 {
+		return errors.New("at least one sensor must be configured")
+	}
+	for i := range n.Sensors {
+		s := &n.Sensors[i]
+		if strings.TrimSpace(s.RPC) == "" {
+			return fmt.Errorf("sensor %d: 'rpc' is required", i)
+		}
+		p := &xpath.Parser{
+			Format:            "xml",
+			Configs:           []xpath.Config{s.Config},
+			DefaultMetricName: "netconf",
+			Log:               n.Log,
+		}
+		if err := p.Init(); err != nil {
+			return fmt.Errorf("sensor %d: %w", i, err)
+		}
+		s.parser = p
+	}
 
+	if err := n.buildHostKeyCallback(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// buildHostKeyCallback constructs the SSH host key verification callback from
+// the configured options.
+func (n *Netconf) buildHostKeyCallback() error {
 	if n.InsecureSkipVerify {
 		if n.Log != nil {
 			n.Log.Warn("insecure_skip_verify is enabled; NETCONF host keys are NOT verified")
@@ -137,7 +193,7 @@ func (n *Netconf) Init() error {
 	return nil
 }
 
-// Gather collects metrics from all devices.
+// Gather collects metrics from every device for every configured sensor.
 func (n *Netconf) Gather(acc telegraf.Accumulator) error {
 	for _, device := range n.Devices {
 		session, err := n.connect(device)
@@ -146,42 +202,27 @@ func (n *Netconf) Gather(acc telegraf.Accumulator) error {
 			continue
 		}
 
-		reply, err := n.exec(session, getInterfaceStatistics)
-		if err != nil {
-			// The session may be dead; drop it so the next cycle reconnects.
-			n.dropConnection(device.Address)
-			acc.AddError(fmt.Errorf("RPC failed for %s: %w", device.Address, err))
-			continue
-		}
+		for i := range n.Sensors {
+			sensor := &n.Sensors[i]
 
-		// Parse the XML reply.
-		var result struct {
-			Interfaces struct {
-				Interface []struct {
-					Name       string `xml:"name"`
-					Statistics struct {
-						InOctets  uint64 `xml:"in-octets"`
-						OutOctets uint64 `xml:"out-octets"`
-					} `xml:"statistics"`
-				} `xml:"interface"`
-			} `xml:"interfaces"`
-		}
-		if err := xml.Unmarshal([]byte(reply.Data), &result); err != nil {
-			acc.AddError(fmt.Errorf("XML parse failed for %s: %w", device.Address, err))
-			continue
-		}
+			reply, err := n.exec(session, sensor.RPC)
+			if err != nil {
+				// The session may be dead; drop it so the next cycle reconnects
+				// and skip the remaining sensors for this device this cycle.
+				n.dropConnection(device.Address)
+				acc.AddError(fmt.Errorf("RPC failed for %s: %w", device.Address, err))
+				break
+			}
 
-		// Add metrics to the accumulator.
-		for _, iface := range result.Interfaces.Interface {
-			tags := map[string]string{
-				"interface": iface.Name,
-				"device":    device.Address,
+			metrics, err := sensor.parser.Parse([]byte(reply.Data))
+			if err != nil {
+				acc.AddError(fmt.Errorf("parsing reply from %s: %w", device.Address, err))
+				continue
 			}
-			fields := map[string]interface{}{
-				"input_bytes":  iface.Statistics.InOctets,
-				"output_bytes": iface.Statistics.OutOctets,
+			for _, m := range metrics {
+				m.AddTag("device", device.Address)
+				acc.AddMetric(m)
 			}
-			acc.AddFields("netconf_interface", fields, tags)
 		}
 	}
 	return nil
