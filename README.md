@@ -16,9 +16,10 @@ reused across cycles, recycled after a long timer (`session_max_age`) or on
 failure, and devices are polled concurrently. The reasoning behind this design —
 and the alternatives that were rejected — is documented in [DESIGN.md](DESIGN.md).
 
-> **Status: beta.** Exercised in a lab, not yet validated against production
-> Cisco/Juniper hardware. The example interface sensor's data model in
-> particular (see [Caveats](#caveats)) may need per-platform adjustment.
+> **Status: beta.** Validated against Cisco IOS-XR (NCS5500 and NCS5700) in a
+> staging network; not yet exercised against Juniper or at production scale.
+> The example sensor's data model is platform-specific (see
+> [Caveats](#caveats)).
 
 ## Metrics
 
@@ -28,7 +29,7 @@ address). The example sensor below produces:
 
 - **Measurement:** `netconf_interface`
 - **Tags:** `device`, `interface`
-- **Fields:** `input_bytes`, `output_bytes`
+- **Fields:** `in_octets`, `out_octets`, `in_pkts`, `out_pkts`
 
 ## Build
 
@@ -88,7 +89,7 @@ Example `plugin.conf` (one instance owns the whole fleet):
     rpc = '''
       <get>
         <filter type="subtree">
-          <interfaces xmlns="urn:ietf:params:xml:ns:yang:ietf-interfaces"/>
+          <interfaces xmlns="http://openconfig.net/yang/interfaces"/>
         </filter>
       </get>
     '''
@@ -96,9 +97,13 @@ Example `plugin.conf` (one instance owns the whole fleet):
     metric_selection = "//*[local-name()='interface']"
     [inputs.netconf.sensor.tags]
       interface = "*[local-name()='name']"
+    ## More counters live under state/counters (errors, discards, unicast/
+    ## broadcast/multicast pkts, …); add the ones you need.
     [inputs.netconf.sensor.fields_int]
-      input_bytes  = ".//*[local-name()='in-octets']"
-      output_bytes = ".//*[local-name()='out-octets']"
+      in_octets  = "*[local-name()='state']/*[local-name()='counters']/*[local-name()='in-octets']"
+      out_octets = "*[local-name()='state']/*[local-name()='counters']/*[local-name()='out-octets']"
+      in_pkts    = "*[local-name()='state']/*[local-name()='counters']/*[local-name()='in-pkts']"
+      out_pkts   = "*[local-name()='state']/*[local-name()='counters']/*[local-name()='out-pkts']"
 ```
 
 ### Sensors
@@ -145,10 +150,16 @@ instead of being written in plaintext.
 
 ## Caveats
 
-- **Example data model.** `ietf-interfaces` exposes operational counters under
-  `/interfaces-state/interface/statistics` on RFC 7223 devices and under
-  `/interfaces/interface/statistics` on RFC 8343 (NMDA) devices. The example
-  sensor targets the latter and may need adjusting for your platform.
+- **Example data model.** The example sensor uses OpenConfig
+  (`http://openconfig.net/yang/interfaces`), whose counters live under
+  `/interfaces/interface/state/counters`. This was chosen because on Cisco
+  IOS-XR the `ietf-interfaces` model is config-only (a plain `<get>` returns no
+  operational counters). Other platforms may expose a different model or
+  namespace; adjust the sensor's filter and XPaths accordingly.
+- **Field-less metrics are dropped.** If a `metric_selection` matches nodes that
+  carry none of the configured fields (e.g. SRv6 locator "interfaces" have no
+  counters), the resulting tag-only metric is discarded rather than emitted —
+  an empty metric is unusable and cannot be serialized.
 - Secret-store references (`@{store:…}`) depend on the secret-store machinery
   being available in the runtime.
 

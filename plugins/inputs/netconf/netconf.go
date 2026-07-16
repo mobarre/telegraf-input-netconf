@@ -170,7 +170,7 @@ func (n *Netconf) SampleConfig() string {
     rpc = '''
       <get>
         <filter type="subtree">
-          <interfaces xmlns="urn:ietf:params:xml:ns:yang:ietf-interfaces"/>
+          <interfaces xmlns="http://openconfig.net/yang/interfaces"/>
         </filter>
       </get>
     '''
@@ -178,9 +178,14 @@ func (n *Netconf) SampleConfig() string {
     metric_selection = "//*[local-name()='interface']"
     [inputs.netconf.sensor.tags]
       interface = "*[local-name()='name']"
+    ## OpenConfig exposes many more counters under state/counters (in/out
+    ## unicast/broadcast/multicast pkts, errors, discards, …); add the ones
+    ## you need as extra fields_int entries.
     [inputs.netconf.sensor.fields_int]
-      input_bytes  = ".//*[local-name()='in-octets']"
-      output_bytes = ".//*[local-name()='out-octets']"
+      in_octets  = "*[local-name()='state']/*[local-name()='counters']/*[local-name()='in-octets']"
+      out_octets = "*[local-name()='state']/*[local-name()='counters']/*[local-name()='out-octets']"
+      in_pkts    = "*[local-name()='state']/*[local-name()='counters']/*[local-name()='in-pkts']"
+      out_pkts   = "*[local-name()='state']/*[local-name()='counters']/*[local-name()='out-pkts']"
 `
 }
 
