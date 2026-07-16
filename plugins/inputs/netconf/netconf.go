@@ -334,6 +334,14 @@ func (n *Netconf) gatherDevice(acc telegraf.Accumulator, device Device) {
 			continue
 		}
 		for _, m := range metrics {
+			// A selection can match nodes that carry none of the configured
+			// fields (e.g. SRv6 locator "interfaces" have no counters). Such a
+			// metric has only tags; the influx serializer rejects it as having
+			// "no serializable fields", which under the execd shim tears down
+			// the output path and exits the process. Drop them at the source.
+			if len(m.FieldList()) == 0 {
+				continue
+			}
 			m.AddTag("device", device.Address)
 			acc.AddMetric(m)
 		}

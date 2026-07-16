@@ -173,6 +173,21 @@ const sampleReply = `<data>
   </interfaces>
 </data>`
 
+// mixedReply pairs a counter-bearing interface with a bare one (an SRv6
+// locator that carries only a name). The bare one yields a metric with tags
+// but no fields — the case that used to crash the execd shim.
+const mixedReply = `<data>
+  <interfaces xmlns="urn:ietf:params:xml:ns:yang:ietf-interfaces">
+    <interface>
+      <name>GigabitEthernet0/0</name>
+      <statistics><in-octets>100</in-octets><out-octets>200</out-octets></statistics>
+    </interface>
+    <interface>
+      <name>srv6-MAIN</name>
+    </interface>
+  </interfaces>
+</data>`
+
 // --- parser -----------------------------------------------------------------
 
 func TestSensorParsesInterfaceStatistics(t *testing.T) {
@@ -457,6 +472,31 @@ func TestGatherTagsMetricsWithDevice(t *testing.T) {
 		if got := m.Tags()["device"]; got != "r1:830" {
 			t.Errorf("device tag = %q, want r1:830", got)
 		}
+	}
+}
+
+// TestGatherDropsFieldlessMetrics guards the fix for the execd crash: a
+// selection can match nodes that carry none of the configured fields (e.g. an
+// SRv6 locator). Such tag-only metrics must never reach the accumulator, or the
+// influx serializer rejects them and the shim tears down the process.
+func TestGatherDropsFieldlessMetrics(t *testing.T) {
+	d := &fakeDialer{reply: mixedReply}
+	n := newPlugin(dev("r1:830"))
+	n.dial = d.fn
+	if err := n.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	acc := &testAccumulator{}
+	n.Gather(acc)
+
+	if acc.metricCount() != 1 {
+		t.Fatalf("got %d metrics, want 1 (field-less interface must be dropped)", acc.metricCount())
+	}
+	if got := acc.metrics[0].Tags()["interface"]; got != "GigabitEthernet0/0" {
+		t.Errorf("surviving metric interface = %q, want GigabitEthernet0/0", got)
+	}
+	if acc.errorCount() != 0 {
+		t.Errorf("unexpected errors: %v", acc.errs)
 	}
 }
 
